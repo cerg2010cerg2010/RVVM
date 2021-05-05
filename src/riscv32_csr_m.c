@@ -45,7 +45,7 @@ static bool riscv32_csr_mhartid(riscv32_vm_state_t *vm, uint32_t csr_id, uint32_
     UNUSED(vm);
     UNUSED(csr_id);
     UNUSED(op);
-    *dest = 0;
+    *dest = vm->csr.hartid;
     return true;
 }
 
@@ -84,7 +84,7 @@ static bool riscv32_csr_mie(riscv32_vm_state_t *vm, uint32_t csr_id, uint32_t* d
     UNUSED(csr_id);
     csr_helper_masked(&vm->csr.ie, dest, op, CSR_MEIP_MASK);
     vm->ev_int = true;
-    vm->wait_event = 0;
+    atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
     return true;
 }
 

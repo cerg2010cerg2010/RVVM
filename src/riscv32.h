@@ -21,6 +21,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "riscv.h"
 #include "rvtimer.h"
+#include "atomic.h"
+#include "threading.h"
 
 enum
 {
@@ -129,7 +131,7 @@ typedef struct {
 } riscv32_mmio_regions_t;
 
 struct riscv32_vm_state_t {
-    size_t wait_event;
+    atomic_int wait_event;
     size_t registers[REGISTERS_MAX];
     riscv32_tlb_t tlb[TLB_SIZE];
     riscv32_phys_mem_t mem;
@@ -147,6 +149,7 @@ struct riscv32_vm_state_t {
         uint32_t cause[4];
         uint32_t tval[4];
         uint32_t ip;
+        uint32_t hartid;
     } csr;
     uint32_t root_page_table;
     bool mmu_virtual;
@@ -179,8 +182,8 @@ void riscv32_debug_func(const riscv32_vm_state_t *vm, const char* fmt, ...);
 
 #define UNUSED(x) (void)x
 
-riscv32_vm_state_t *riscv32_create_vm();
-void riscv32_run(riscv32_vm_state_t *vm);
+riscv32_vm_state_t *riscv32_create_vm(uint32_t hartid);
+thread_handle_t riscv32_run(riscv32_vm_state_t *vm);
 void riscv32_destroy_vm(riscv32_vm_state_t *vm);
 void riscv32_dump_registers(riscv32_vm_state_t *vm);
 void riscv32_illegal_insn(riscv32_vm_state_t *vm, const uint32_t instruction);
@@ -189,3 +192,4 @@ void riscv32_priv_init();
 bool riscv32_handle_ip(riscv32_vm_state_t *vm, bool wfi);
 void riscv32_interrupt(riscv32_vm_state_t *vm, uint32_t cause);
 void riscv32_trap(riscv32_vm_state_t *vm, uint32_t cause, uint32_t tval);
+riscv32_vm_state_t* riscv32_get_hart_by_id(uint32_t hartid);

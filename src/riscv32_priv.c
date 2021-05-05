@@ -17,8 +17,6 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-#include <assert.h>
-
 #include "riscv.h"
 #include "riscv32.h"
 #include "cpu/riscv_cpu.h"
@@ -26,6 +24,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "riscv32_priv.h"
 #include "riscv32_csr.h"
 #include "bit_ops.h"
+#include "threading.h"
 
 extern uint64_t clint_mtimecmp;
 extern uint64_t clint_mtime;
@@ -84,7 +83,7 @@ static void riscv32i_system(riscv32_vm_state_t *vm, const uint32_t instruction)
         * External interrupts are dropping CPU executor to scheduler,
         * where it gets ev_int flags and jumps into trap handler on it's own
         */
-        while (!rvtimer_pending(&vm->timer) && vm->wait_event) {
+        while (!rvtimer_pending(&vm->timer) && atomic_load_explicit(&vm->wait_event, memory_order_acquire)) {
             sleep_ms(1);
         }
         if (rvtimer_pending(&vm->timer)) vm->csr.ip |= (1 << INTERRUPT_MTIMER);
@@ -99,6 +98,7 @@ static void riscv32i_system(riscv32_vm_state_t *vm, const uint32_t instruction)
     switch (instruction & RV32_S_FENCE_MASK) {
     case RV32_S_SFENCE_VMA:
         riscv32_debug(vm, "RV32I: sfence.vma %r, %r", rs1, rs1);
+        atomic_thread_fence(memory_order_seq_cst);
         if (vm->priv_mode >= PRIVILEGE_SUPERVISOR) {
             riscv32_tlb_flush(vm);
         } else {
@@ -123,6 +123,17 @@ static void riscv32i_fence(riscv32_vm_state_t *vm, const uint32_t instruction)
 {
     UNUSED(vm);
     UNUSED(instruction);
+    bool pw = bit_check(instruction, 24);
+    //bool pr = bit_check(instruction, 25);
+    //bool sw = bit_check(instruction, 20);
+    bool sr = bit_check(instruction, 21);
+    if (!pw) {
+        atomic_thread_fence(memory_order_acquire);
+    } else if (!sr) {
+        atomic_thread_fence(memory_order_release);
+    } else {
+        atomic_thread_fence(memory_order_seq_cst);
+    }
     riscv32_debug(vm, "RV32I: unimplemented fence %h", instruction);
 }
 
@@ -130,6 +141,7 @@ static void riscv32zifence_i(riscv32_vm_state_t *vm, const uint32_t instruction)
 {
     UNUSED(vm);
     UNUSED(instruction);
+    atomic_thread_fence(memory_order_seq_cst);
     riscv32_debug(vm, "RV32I: unimplemented zifence.i %h", instruction);
 }
 

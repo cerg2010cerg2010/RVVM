@@ -58,7 +58,7 @@ void riscv32_illegal_insn(riscv32_vm_state_t *vm, const uint32_t instruction)
 #define MAX_VMS 256
 #define MAX_SCREENS 2
 
-static spinlock_t global_lock;
+/*static*/ spinlock_t global_lock;
 static riscv32_vm_state_t* global_vm_list[MAX_VMS] = {NULL};
 static size_t global_vm_count = 0;
 static thread_handle_t global_irq_thread;
@@ -71,8 +71,12 @@ static void* global_irq_handler(void* arg)
     while (true) {
         sleep_ms(10);
         spin_lock(&global_lock);
-        for (size_t i=0; i<global_vm_count; ++i) {
+        for (size_t i=0, vmcnt = 0; i<MAX_VMS; ++i) {
             vm = global_vm_list[i];
+            if (vm == NULL) {
+                    continue;
+            }
+
             /*
             * Queue interrupt data & flag, wake CPU thread.
             * Technically, writing to wait_event is a race condition,
@@ -81,7 +85,11 @@ static void* global_irq_handler(void* arg)
             */
             vm->ev_int_mask |= (1 << INTERRUPT_MTIMER);
             vm->ev_int = true;
-            vm->wait_event = 0;
+            atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
+
+            if (++vmcnt == global_vm_count) {
+                break;
+            }
         }
         spin_unlock(&global_lock);
         fb_update(global_screens, global_screen_count);
@@ -91,73 +99,44 @@ static void* global_irq_handler(void* arg)
 
 void riscv32_interrupt(riscv32_vm_state_t *vm, uint32_t cause)
 {
-    spin_lock(&global_lock);
     vm->ev_int_mask |= (1 << cause);
     vm->ev_int = true;
-    vm->wait_event = 0;
-    spin_unlock(&global_lock);
+    atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
 }
 
-static void register_vm(riscv32_vm_state_t *vm)
+static bool register_vm(riscv32_vm_state_t *vm, uint32_t hartid)
 {
+    if (hartid >= MAX_VMS) {
+        return false;
+    }
+
     spin_lock(&global_lock);
-    if (global_vm_count == 0) {
-        global_irq_thread = thread_create(global_irq_handler);
-    }
-    if (global_vm_count >= MAX_VMS - 1) {
-        printf("ERROR: Too much VMs created!\n");
-        exit(-1);
-    }
-    global_vm_list[global_vm_count] = vm;
+    global_vm_list[hartid] = vm;
+    vm->csr.hartid = hartid;
     global_vm_count++;
     spin_unlock(&global_lock);
+    return true;
 }
 
 static void deregister_vm(riscv32_vm_state_t *vm)
 {
     spin_lock(&global_lock);
-    for (size_t i=0; i<global_vm_count; ++i) {
-        if (global_vm_list[i] == vm) {
-            global_vm_count--;
-            for (size_t j=i; j<global_vm_count; ++j) {
-                global_vm_list[j] = global_vm_list[j+1];
-            }
-            return;
-        }
-    }
+    global_vm_list[vm->csr.hartid] = NULL;
     if (global_vm_count == 0) {
         thread_kill(global_irq_thread);
     }
     spin_unlock(&global_lock);
 }
 
-riscv32_vm_state_t *riscv32_create_vm()
+static bool devices_init(riscv32_vm_state_t *vm)
 {
-    static bool global_init = false;
-    if (!global_init) {
-        riscv32_cpu_init();
-        riscv32_priv_init();
-        for (uint32_t i=0; i<4096; ++i)
-            riscv32_csr_init(i, "illegal", riscv32_csr_illegal);
-        riscv32_csr_m_init();
-        riscv32_csr_s_init();
-        riscv32_csr_u_init();
-        spin_init(&global_lock);
-        global_init = true;
-    }
-
-    riscv32_vm_state_t *vm = (riscv32_vm_state_t*)malloc(sizeof(riscv32_vm_state_t));
-    memset(vm, 0, sizeof(riscv32_vm_state_t));
-
     // 0x10000 pages = 256M
     if (!riscv32_init_phys_mem(&vm->mem, 0x80000000, 0x10000)) {
         printf("Failed to allocate VM physical RAM!\n");
-        free(vm);
-        return NULL;
+        return false;
     }
-    riscv32_tlb_flush(vm);
+
     ns16550a_init(vm, 0x10000000);
-    riscv32_mmio_add_device(vm, 0x2000000, 0x2010000, clint_mmio_handler, NULL);
 
     void *plic_data = plic_init(vm, 0xC000000);
 
@@ -170,15 +149,93 @@ riscv32_vm_state_t *riscv32_create_vm()
     altps2_init(vm, 0x20001000, plic_data, 2, &ps2_keyboard);
 
     init_fb(vm, &global_screens[global_screen_count++], 640, 480, 0x30000000, &ps2_mouse, &ps2_keyboard);
-    rvtimer_init(&vm->timer, 0x989680); // 10 MHz timer
+    return true;
+}
+
+riscv32_vm_state_t *riscv32_create_vm(uint32_t hartid)
+{
+    if (hartid >= MAX_VMS) {
+        return NULL;
+    }
+
+    riscv32_vm_state_t *vm = (riscv32_vm_state_t*)calloc(sizeof(riscv32_vm_state_t), 1);
+    if (vm == NULL) {
+        return NULL;
+    }
+
+    static bool global_init = false;
+    if (!global_init) {
+        riscv32_cpu_init();
+        riscv32_priv_init();
+        for (uint32_t i=0; i<4096; ++i)
+            riscv32_csr_init(i, "illegal", riscv32_csr_illegal);
+        riscv32_csr_m_init();
+        riscv32_csr_s_init();
+        riscv32_csr_u_init();
+        spin_init(&global_lock);
+
+        if (!devices_init(vm)) {
+            goto err;
+        }
+
+        global_irq_thread = thread_create(global_irq_handler, NULL);
+        global_init = true;
+    } else {
+        // Copy MMIO data from other VM so we don't need to reinit
+        // all the devices again
+        spin_lock(&global_lock);
+        const riscv32_vm_state_t *parent_vm = NULL;
+        for (size_t i = 0; i < MAX_VMS; ++i) {
+            if (global_vm_list[i] != NULL) {
+                parent_vm = global_vm_list[i];
+                break;
+            }
+        }
+
+        vm->mem = parent_vm->mem;
+        vm->mmio = parent_vm->mmio;
+
+        // Add CLINT of this hart to all other VMs so we can send an IPI
+        for (size_t i = 0; i < MAX_VMS; ++i) {
+            if (global_vm_list[i] == NULL) {
+                continue;
+            }
+
+            riscv32_mmio_add_device(global_vm_list[i],
+                    CLINT_BASE_ADDR + CLINT_LEN * hartid,
+                    CLINT_BASE_ADDR + CLINT_LEN * (hartid + 1),
+                    clint_mmio_handler,
+                    vm);
+        }
+        spin_unlock(&global_lock);
+    }
+
+    riscv32_mmio_add_device(vm,
+            CLINT_BASE_ADDR + CLINT_LEN * hartid,
+            CLINT_BASE_ADDR + CLINT_LEN * (hartid + 1),
+            clint_mmio_handler,
+            vm);
+
+    rvtimer_init(&vm->timer, 10000000); // 10 MHz timer
+
+    riscv32_tlb_flush(vm);
+
     vm->mmu_virtual = false;
     vm->priv_mode = PRIVILEGE_MACHINE;
     vm->csr.edeleg[PRIVILEGE_HYPERVISOR] = 0xFFFFFFFF;
     vm->csr.ideleg[PRIVILEGE_HYPERVISOR] = 0xFFFFFFFF;
     vm->registers[REGISTER_PC] = vm->mem.begin;
-    register_vm(vm);
+    if (!register_vm(vm, hartid))
+    {
+        printf("Unable to register VM with id %d\n", (int)hartid);
+        goto err;
+    }
 
     return vm;
+err:
+    free(vm);
+    return NULL;
+
 }
 
 void riscv32_destroy_vm(riscv32_vm_state_t *vm)
@@ -198,7 +255,7 @@ static void riscv32_perform_interrupt(riscv32_vm_state_t *vm, uint32_t cause)
         if ((vm->csr.ideleg[priv] & (1 << cause)) == 0) break;
     }
     //printf("Int %x\n", cause);
-    riscv32_debug(vm, "Int %d -> %d, cause: %h", vm->priv_mode, priv, cause);
+    riscv32_debug(vm, "Int %d -> %d, cause: %h, hartid: %d", vm->priv_mode, priv, cause, vm->csr.hartid);
 
     vm->csr.epc[priv] = riscv32i_read_register_u(vm, REGISTER_PC);
     vm->csr.cause[priv] = cause | INTERRUPT_MASK;
@@ -214,7 +271,7 @@ static void riscv32_perform_interrupt(riscv32_vm_state_t *vm, uint32_t cause)
         vm->csr.status &= 0xFFFFFFFD;
     }
     vm->priv_mode = priv;
-    vm->wait_event = 0;
+    atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
 }
 
 void riscv32_trap(riscv32_vm_state_t *vm, uint32_t cause, uint32_t tval)
@@ -224,7 +281,7 @@ void riscv32_trap(riscv32_vm_state_t *vm, uint32_t cause, uint32_t tval)
     for (priv=PRIVILEGE_MACHINE; priv>vm->priv_mode; --priv) {
         if ((vm->csr.edeleg[priv] & (1 << cause)) == 0) break;
     }
-    riscv32_debug(vm, "Trap priv %d -> %d, cause: %h, tval: %h", vm->priv_mode, priv, cause, tval);
+    riscv32_debug(vm, "Trap priv %d -> %d, cause: %h, tval: %h, hartid: %d", vm->priv_mode, priv, cause, tval, vm->csr.hartid);
 
     vm->csr.epc[priv] = riscv32i_read_register_u(vm, REGISTER_PC);
     vm->csr.cause[priv] = cause;
@@ -241,7 +298,7 @@ void riscv32_trap(riscv32_vm_state_t *vm, uint32_t cause, uint32_t tval)
     }
     vm->priv_mode = priv;
     vm->ev_trap = true;
-    vm->wait_event = 0;
+    atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
 }
 
 bool riscv32_handle_ip(riscv32_vm_state_t *vm, bool wfi)
@@ -371,12 +428,13 @@ static void riscv32_trap_jump(riscv32_vm_state_t *vm)
     riscv32i_write_register_u(vm, REGISTER_PC, pc);
 }
 
-void riscv32_run(riscv32_vm_state_t *vm)
+static void* riscv32_run_impl(void *arg)
 {
+    riscv32_vm_state_t *vm = (riscv32_vm_state_t *) arg;
     assert(vm);
 
     while (true) {
-        vm->wait_event = 1;
+        atomic_store_explicit(&vm->wait_event, 1, memory_order_release);
         riscv32_run_till_event(vm);
         if (vm->ev_trap) {
             // Event came from CPU thread, either from trap or interrupted WFI
@@ -396,4 +454,20 @@ void riscv32_run(riscv32_vm_state_t *vm)
             }
         }
     }
+
+    return NULL;
+}
+
+thread_handle_t riscv32_run(riscv32_vm_state_t *vm)
+{
+    return thread_create(&riscv32_run_impl, vm);
+}
+
+riscv32_vm_state_t* riscv32_get_hart_by_id(uint32_t hartid)
+{
+    if (hartid >= MAX_VMS) {
+        return NULL;
+    }
+
+    return global_vm_list[hartid];
 }

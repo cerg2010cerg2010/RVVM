@@ -28,7 +28,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 // Simple math operations (sign-extend int bits, etc) for internal usage
 // this entire header is cursed (though everything optimizes fine)
 
-#define LONG_BITS (CHAR_BIT * sizeof(long))
+#define LONG_BITS (CHAR_BIT * sizeof(ptrdiff_t))
 
 /*
 * Sign-extend bits in the lower part of val into signed long
@@ -37,7 +37,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 *
 *     [ext is now equal to signed lower 20 bits of val]
 */
-static inline long sign_extend(long val, uint8_t bits)
+static inline long sign_extend(ptrdiff_t val, uint8_t bits)
 {
     return (val << (LONG_BITS - bits)) >> (LONG_BITS - bits);
 }

@@ -156,7 +156,7 @@ void riscv_run_till_event(rvvm_hart_state_t *vm)
     xaddr_t inst_addr, upper_addr = vm->registers[REGISTER_PC] + 0x1000, tlb_key;
 
     // Execute instructions loop until some event occurs (interrupt, trap)
-    while (likely(vm->wait_event)) {
+    while (likely(atomic_load_explicit(&vm->wait_event, memory_order_acquire))) {
         vm->registers[REGISTER_ZERO] = 0;
         inst_addr = vm->registers[REGISTER_PC];
         //if ((upper_addr | 0xFFF) - inst_addr > 0xFFC) { // idk
@@ -172,7 +172,7 @@ void riscv_run_till_event(rvvm_hart_state_t *vm)
         } else riscv_emulate(vm, read_uint32_le(inst_ptr + (inst_addr & 0xFFF)));
 #ifndef DISABLE_DISPATCH_UNROLL
         // Gains about 10% more performance with -O3
-        if (unlikely(!vm->wait_event)) break;
+        if (unlikely(!atomic_load_explicit(&vm->wait_event, memory_order_acquire))) break;
 
         vm->registers[REGISTER_ZERO] = 0;
         inst_addr = vm->registers[REGISTER_PC];

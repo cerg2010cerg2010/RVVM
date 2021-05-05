@@ -30,6 +30,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "riscv32_mmu.h"
 #include "riscv32_csr.h"
 #include "elf_load.h"
+#include "threading.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -39,6 +40,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <unistd.h>
 #include <fcntl.h>
 #endif
+
+#define HART_COUNT 1
 
 typedef struct {
     const char* bootrom;
@@ -132,7 +135,7 @@ static void init_flash(riscv32_vm_state_t* vm, uint32_t addr, const char* filena
     }
     HANDLE hm = CreateFileMappingA(hf, NULL, PAGE_READWRITE, 0, 0, NULL);
     void* tmp = MapViewOfFile(hm, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
-    riscv32_mmio_add_device(vm, addr, addr + GetFileSize(hf, NULL) - 1, flash_mmio_handler, tmp);
+    riscv32_mmio_add_device(vm, addr, addr + GetFileSize(hf, NULL), flash_mmio_handler, tmp);
 }
 #else
 static void init_flash(riscv32_vm_state_t* vm, uint32_t addr, const char* filename)
@@ -146,9 +149,66 @@ static void init_flash(riscv32_vm_state_t* vm, uint32_t addr, const char* filena
     fstat(fd, &filestat);
     size_t filesize = filestat.st_size & ~(sysconf(_SC_PAGE_SIZE) - 1);
     void* tmp = mmap(NULL, filesize, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-    riscv32_mmio_add_device(vm, addr, addr + filesize - 1, flash_mmio_handler, tmp);
+    riscv32_mmio_add_device(vm, addr, addr + filesize, flash_mmio_handler, tmp);
 }
 #endif
+
+static bool load_dtb(riscv32_vm_state_t *vm, const char *dtb_path, size_t *dtb_addr, size_t *dtb_size, bool setup_sbi)
+{
+    if (dtb_path == NULL || dtb_addr == NULL || dtb_size == NULL)
+    {
+        return false;
+    }
+
+    *dtb_addr = vm->mem.begin + vm->mem.size - 0x8000000;
+
+    // DTB is aligned by 2MB
+    *dtb_size = load_file_to_ram(vm, *dtb_addr, dtb_path);
+    if (*dtb_size == 0)
+    {
+        return false;
+    }
+
+    printf("DTB loaded at: 0x%zx size: %zx\n", *dtb_addr, *dtb_size);
+
+    if (setup_sbi)
+    {
+        // OpenSBI FW_DYNAMIC struct passed in a2 register
+        if (vm->mem.size - *dtb_addr + *dtb_size >= 24)
+        {
+            void* addr = vm->mem.data + vm->mem.begin + vm->mem.size - 0x200000 + *dtb_size;
+            write_uint32_le(addr, 0x4942534F); // magic
+            write_uint32_le(addr+4, 0x2); // version
+            write_uint32_le(addr+8, 0x0); // next_addr
+            write_uint32_le(addr+12, 0x1); // next_mode
+            write_uint32_le(addr+16, 0x1); // options
+            write_uint32_le(addr+20, 0x0); // boot_hart
+        }
+        else
+        {
+            printf("ERROR: No space for FW_DYNAMIC struct\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void setup_hart(riscv32_vm_state_t *vm, size_t dtb_addr, size_t dtb_size, bool is_linux)
+{
+    riscv32i_write_register_u(vm, REGISTER_X10, vm->csr.hartid);
+
+    // pass DTB address in a1 register
+    riscv32i_write_register_u(vm, REGISTER_X11, dtb_addr);
+
+    if (is_linux) {
+        uint32_t medeleg = -1;
+        riscv32_csr_op(vm, 0x302, &medeleg, CSR_SWAP);
+        vm->priv_mode = PRIVILEGE_SUPERVISOR;
+    } else {
+        riscv32i_write_register_u(vm, REGISTER_X12, vm->mem.begin + vm->mem.size - 0x200000 + dtb_size);
+    }
+}
 
 int main(int argc, char** argv)
 {
@@ -162,11 +222,11 @@ int main(int argc, char** argv)
     parse_args(argc, argv, &args);
     if (args.bootrom == NULL)
     {
-        printf("Usage: %s <bootrom> [--linux] [-dtb=<device.dtb>]\n", argv[0]);
+        printf("Usage: %s <bootrom> [--linux] [-dtb=<device.dtb>] [-image=<rootfs.img>]\n", argv[0]);
         return 0;
     }
 
-    riscv32_vm_state_t* vm = riscv32_create_vm();
+    riscv32_vm_state_t* vm = riscv32_create_vm(0);
     if (vm == NULL)
     {
         printf("ERROR: VM creation failed.\n");
@@ -187,65 +247,55 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    size_t dtb_addr = 0;
+    size_t dtb_size = 0;
+
     if (args.dtb)
     {
-	    size_t dtb_addr = vm->mem.begin + vm->mem.size - 0x8000000;
-
-	    // Explicitly set a0 to 0 as boot hart
-	    riscv32i_write_register_u(vm, REGISTER_X10, 0);
-
-	    // DTB is aligned by 2MB
-	    uint32_t dts = load_file_to_ram(vm, dtb_addr, args.dtb);
-	    if (dts == 0)
-	    {
-		    printf("ERROR: Failed to load DTB.\n");
-		    return 1;
-	    }
-
-	    printf("DTB loaded at: 0x%zx size: %"PRId32"\n", dtb_addr, dts);
-
-	    // pass DTB address in a1 register
-	    riscv32i_write_register_u(vm, REGISTER_X11, dtb_addr);
-
-	    if (args.is_linux)
-	    {
-		    uint32_t medeleg = -1;
-		    riscv32_csr_op(vm, 0x302, &medeleg, CSR_SWAP);
-
-		    vm->priv_mode = PRIVILEGE_SUPERVISOR;
-	    }
-	    else
-	    {
-		    // OpenSBI FW_DYNAMIC struct passed in a2 register
-		    if (vm->mem.size - dtb_addr + dts >= 24)
-		    {
-			    void* addr = vm->mem.data + vm->mem.begin + vm->mem.size - 0x200000 + dts;
-			    write_uint32_le(addr, 0x4942534F); // magic
-			    write_uint32_le(addr+4, 0x2); // version
-			    write_uint32_le(addr+8, 0x0); // next_addr
-			    write_uint32_le(addr+12, 0x1); // next_mode
-			    write_uint32_le(addr+16, 0x1); // options
-			    write_uint32_le(addr+20, 0x0); // boot_hart
-			    riscv32i_write_register_u(vm, REGISTER_X12, vm->mem.begin + vm->mem.size - 0x200000 + dts);
-		    }
-		    else
-		    {
-			    printf("WARN: No space for FW_DYNAMIC struct\n");
-		    }
-
-#if 0
-		    //XXX - Linux raw image
-		    uint32_t medeleg = -1;
-		    riscv32_csr_op(vm, 0x302, &medeleg, CSR_SWAP);
-		    vm->priv_mode = PRIVILEGE_SUPERVISOR;
-#endif
-	    }
+        if (!load_dtb(vm, args.dtb, &dtb_addr, &dtb_size, !args.is_linux))
+        {
+            printf("ERROR: Failed to load DTB.\n");
+            riscv32_destroy_vm(vm);
+            return 1;
+        }
     }
 
-    if (args.flash_image) init_flash(vm, 0x40000000, args.flash_image);
+    if (args.flash_image)
+    {
+        init_flash(vm, 0x40000000, args.flash_image);
+    }
 
-    riscv32_run(vm);
+    riscv32_vm_state_t* vms[HART_COUNT];
+    vms[0] = vm;
+    setup_hart(vms[0], dtb_addr, dtb_size, args.is_linux);
 
-    riscv32_destroy_vm(vm);
+    for (uint8_t i = 1; i < HART_COUNT; ++i)
+    {
+        vms[i] = riscv32_create_vm(i);
+        if (!vms[i])
+        {
+            printf("ERROR: VM creation failed.\n");
+            // XXX: cleanup?
+            return 1;
+        }
+
+        setup_hart(vms[i], dtb_addr, dtb_size, args.is_linux);
+    }
+
+    thread_handle_t harts[HART_COUNT];
+    for (uint8_t i = 0; i < HART_COUNT; ++i)
+    {
+	    harts[i] = riscv32_run(vms[i]);
+    }
+
+    for (uint8_t i = 0; i < HART_COUNT; ++i)
+    {
+	    thread_join(harts[i]);
+    }
+
+    for (size_t i = 0; i < HART_COUNT; ++i)
+    {
+	    riscv32_destroy_vm(vms[i]);
+    }
     return 0;
 }

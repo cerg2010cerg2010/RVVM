@@ -17,25 +17,37 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include "clint.h"
+#include "riscv32.h"
 #include "riscv32_mmu.h"
 #include "rvtimer.h"
 #include "mem_ops.h"
 #include "bit_ops.h"
+#include "spinlock.h"
 
-bool clint_mmio_handler(riscv32_vm_state_t* vm, riscv32_mmio_device_t* device, uint32_t offset, void* data, uint32_t size, uint8_t access)
+extern spinlock_t global_lock;
+
+bool clint_mmio_handler(riscv32_vm_state_t* source_vm, riscv32_mmio_device_t* device, uint32_t offset, void* data, uint32_t size, uint8_t access)
 {
-    UNUSED(device);
+    riscv32_vm_state_t *vm = (riscv32_vm_state_t *) device->data;
     uint8_t tmp[8];
+    UNUSED(source_vm);
+    // XXX: locking?
+    spin_lock(&global_lock);
+
     // MSIP register, bit 0 drives MSIP interrupt bit of the hart
     if (offset == 0) {
         if (access == MMU_WRITE) {
             uint8_t msip = ((*(uint8_t*)data) & 1);
-            vm->csr.ip = bit_replace(vm->csr.ip, 3, 1, msip);
+            if (msip) {
+                riscv32_interrupt(vm, INTERRUPT_MSOFTWARE);
+            } else {
+                vm->csr.ip &= ~(1 << INTERRUPT_MSOFTWARE);
+            }
         } else {
             memset(data, 0, size);
-            *(uint8_t*)data = bit_cut(vm->csr.ip, 3, 1);
+            *(uint8_t*)data = bit_cut(vm->csr.ip, INTERRUPT_MSOFTWARE, 1);
         }
-        return true;
+        goto out;
     }
     rvtimer_update(&vm->timer);
     // MTIMECMP register, 64-bit compare register for timer interrupts
@@ -48,7 +60,7 @@ bool clint_mmio_handler(riscv32_vm_state_t* vm, riscv32_mmio_device_t* device, u
         } else {
             memcpy(data, tmp + offset, size);
         }
-        return true;
+        goto out;
     }
     // MTIME register, 64-bit timer value
     if (offset >= 0xBFF8 && (offset + size) <= 0xC000) {
@@ -61,7 +73,13 @@ bool clint_mmio_handler(riscv32_vm_state_t* vm, riscv32_mmio_device_t* device, u
         } else {
             memcpy(data, tmp + offset, size);
         }
-        return true;
+        goto out;
     }
+
+    spin_unlock(&global_lock);
     return false;
+
+out:
+    spin_unlock(&global_lock);
+    return true;
 }

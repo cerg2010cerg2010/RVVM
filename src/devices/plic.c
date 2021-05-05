@@ -30,7 +30,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 /* adjustable limits */
 #define SOURCE_MAX 32 /* max 1024 */
-#define CTX_MAX 1 /* max 15672 */
+#define CTX_MAX 32 /* max 15672 */
 
 struct plic
 {
@@ -245,7 +245,7 @@ static bool plic_ctxflag_handler(riscv32_vm_state_t *vm, struct plic *dev, uint3
 				/* trigger CPU to execute our next interrupt */
 				vm->ev_int_mask |= (1 << INTERRUPT_SEXTERNAL);
 				vm->ev_int = 1;
-				vm->wait_event = 0;
+				atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
 			}
 		}
 		else
@@ -370,21 +370,22 @@ bool plic_send_irq(riscv32_vm_state_t *vm, void *data, uint32_t id)
 	/* mark the interrupt as pending */
 	set_int_pending(dev, id, 1);
 
-	/* reading hart id is racy, don't do this for now */
-#if 0
-	/* read hart id */
-	uint8_t prev_priv = vm->priv_mode;
-	vm->priv_mode = PRIVILEGE_MACHINE;
-	uint32_t hartid = 0;
-	riscv32_csr_op(vm, 0x123, &hartid, CSR_SWAP);
-	/* don't bother setting hartid back, it's R/O anyway... */
-	vm->priv_mode = prev_priv;
-#else
-	uint32_t hartid = 0;
-#endif
+	uint32_t hartid = vm->csr.hartid;
+
+	/* Current interrupt map is:
+	 *
+	 * &cpu0_intc 11 &cpu0_intc 9
+	 * &cpu1_intc 11 &cpu1_intc 9
+	 * &cpu2_intc 11 &cpu2_intc 9
+	 * ....
+	 * i.e. even context goes to INTERRUPT_MEXTERNAL, odd is INTERRUPT_SEXTERNAL.
+	 * There's no way to choose interrupt privilege for now,
+	 * so we'll always use odd context number.
+	 */
+	uint32_t ctx = (hartid << 1) + 1;
 
 	/* update the current selected interrupt ID */
-	select_int(dev, hartid, id);
+	select_int(dev, ctx, id);
 
 	/* deliver the event to CPU. Use S-mode external interrupt as M-mode
 	 * is useless - SBI just ignores it, but S-mode interrupts can be handled
@@ -394,7 +395,7 @@ bool plic_send_irq(riscv32_vm_state_t *vm, void *data, uint32_t id)
 	vm->ev_int = true;
 	vm->wait_event = 0;
 #else
-	riscv32_interrupt(vm, INTERRUPT_SEXTERNAL);
+	riscv32_interrupt(vm, (ctx & 1) ? INTERRUPT_SEXTERNAL : INTERRUPT_MEXTERNAL);
 #endif
 	spin_unlock(&dev->lock);
 	return true;

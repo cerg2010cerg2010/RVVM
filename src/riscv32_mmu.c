@@ -21,6 +21,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "riscv32.h"
 #include "riscv32_mmu.h"
+#include "spinlock.h"
 
 void riscv32_mmu_dump(riscv32_vm_state_t *vm)
 {
@@ -77,7 +78,7 @@ void riscv32_mmu_dump(riscv32_vm_state_t *vm)
 }
 
 // Check that specific physical address belongs to RAM
-inline bool phys_addr_in_mem(riscv32_phys_mem_t mem, uint32_t page_addr)
+static inline bool phys_addr_in_mem(riscv32_phys_mem_t mem, uint32_t page_addr)
 {
     return page_addr >= mem.begin && (page_addr - mem.begin) < mem.size;
 }
@@ -103,12 +104,14 @@ static void tlb_put(riscv32_vm_state_t* vm, uint32_t addr, uint32_t page_addr, u
 }
 
 // Virtual memory addressing mode (SV32)
+static spinlock_t mmu_lock;
 static bool riscv32_mmu_translate_sv32(riscv32_vm_state_t* vm, uint32_t addr, uint8_t access, uint32_t* dest_addr)
 {
     uint32_t pte_addr = vm->root_page_table | ((addr >> 20) & 0xFFC);
     uint32_t pte;
 
     if (phys_addr_in_mem(vm->mem, pte_addr)) {
+        spin_lock(&mmu_lock);
         pte = read_uint32_le(vm->mem.data + pte_addr);
         if (pte & MMU_VALID_PTE) {
             if (pte & MMU_LEAF_PTE) {
@@ -116,13 +119,25 @@ static bool riscv32_mmu_translate_sv32(riscv32_vm_state_t* vm, uint32_t addr, ui
                 // Check that PPN[0] is 0, otherwise the page is misaligned
                 if ((pte & (access | 0xFFC00)) == access) {
                     // TODO: A/D flag updates should be atomic
-                    pte |= MMU_PAGE_ACCESSED;
-                    if (access & MMU_WRITE) pte |= MMU_PAGE_DIRTY;
-                    write_uint32_le(vm->mem.data + pte_addr, pte);
+                    // reduce writes to PTE to avoid races
+                    bool need_rewrite = false;
+
+                    if (!(pte & MMU_PAGE_ACCESSED)) {
+                        pte |= MMU_PAGE_ACCESSED;
+                        need_rewrite = true;
+                    }
+
+                    if (!(pte & MMU_PAGE_DIRTY) && (access & MMU_WRITE)) {
+                        pte |= MMU_PAGE_DIRTY;
+                        need_rewrite = true;
+                    }
+
+                    if (need_rewrite) write_uint32_le(vm->mem.data + pte_addr, pte);
+
                     pte_addr = ((pte & 0xFFF00000) << 2) | (addr & 0x3FFFFF);
                     tlb_put(vm, addr, pte_addr, access);
                     *dest_addr = pte_addr;
-                    return true;
+                    goto out;
                 }
             } else {
                 // PGT entry is a pointer to next pagetable
@@ -130,13 +145,24 @@ static bool riscv32_mmu_translate_sv32(riscv32_vm_state_t* vm, uint32_t addr, ui
                 if (phys_addr_in_mem(vm->mem, pte_addr)) {
                     pte = read_uint32_le(vm->mem.data + pte_addr);
                     if ((pte & MMU_VALID_PTE) && (pte & access)) {
-                        pte |= MMU_PAGE_ACCESSED;
-                        if (access & MMU_WRITE) pte |= MMU_PAGE_DIRTY;
-                        write_uint32_le(vm->mem.data + pte_addr, pte);
+                        bool need_rewrite = false;
+
+                        if (!(pte & MMU_PAGE_ACCESSED)) {
+                            pte |= MMU_PAGE_ACCESSED;
+                            need_rewrite = true;
+                        }
+
+                        if (!(pte & MMU_PAGE_DIRTY) && (access & MMU_WRITE)) {
+                            pte |= MMU_PAGE_DIRTY;
+                            need_rewrite = true;
+                        }
+
+                        if (need_rewrite) write_uint32_le(vm->mem.data + pte_addr, pte);
+
                         pte_addr = ((pte & 0xFFFFFC00) << 2) | (addr & 0xFFF);
                         tlb_put(vm, addr, pte_addr, access);
                         *dest_addr = pte_addr;
-                        return true;
+                        goto out;
                     }
                 }
             }
@@ -144,7 +170,12 @@ static bool riscv32_mmu_translate_sv32(riscv32_vm_state_t* vm, uint32_t addr, ui
     }
 
     // No valid address translation can be done (invalid PTE or protection fault)
+    spin_unlock(&mmu_lock);
     return false;
+
+out:
+    spin_unlock(&mmu_lock);
+    return true;
 }
 
 // Flat 32-bit physical addressing mode (Mbare)
@@ -161,7 +192,7 @@ static bool riscv32_mmio_op(riscv32_vm_state_t* vm, uint32_t addr, void* dest, u
     riscv32_mmio_device_t* device;
     for (uint32_t i=0; i<vm->mmio.count; ++i) {
         device = &vm->mmio.regions[i];
-        if (addr >= device->base_addr && addr <= device->end_addr) {
+        if (addr >= device->base_addr && addr < device->end_addr) {
             return device->handler(vm, device, addr - device->base_addr, dest, size, access);
         }
     }
@@ -176,6 +207,7 @@ bool riscv32_init_phys_mem(riscv32_phys_mem_t* mem, uint32_t begin, uint32_t pag
     mem->data = tmp - begin;
     mem->begin = begin;
     mem->size = pages * 4096;
+    spin_init(&mmu_lock);
     return true;
 }
 
@@ -189,6 +221,8 @@ void riscv32_destroy_phys_mem(riscv32_phys_mem_t* mem)
 
 void riscv32_mmio_add_device(riscv32_vm_state_t* vm, uint32_t base_addr, uint32_t end_addr, riscv32_mmio_handler_t handler, void* data)
 {
+    assert(end_addr > base_addr);
+
     if (vm->mmio.count > 255) {
         printf("ERROR: Too much MMIO zones!\n");
         exit(0);
@@ -206,7 +240,7 @@ void riscv32_mmio_remove_device(riscv32_vm_state_t* vm, uint32_t addr)
     riscv32_mmio_device_t* device;
     for (uint32_t i=0; i<vm->mmio.count; ++i) {
         device = &vm->mmio.regions[i];
-        if (addr >= device->base_addr && addr <= device->end_addr) {
+        if (addr >= device->base_addr && addr < device->end_addr) {
             if (device->data) free(device->data);
             vm->mmio.count--;
             for (uint32_t j=i; j<vm->mmio.count; ++j) {
@@ -221,8 +255,8 @@ void riscv32_tlb_flush(riscv32_vm_state_t* vm)
 {
     // No ASID support as of now (TLB is quite small, there are no benefits)
     memset(vm->tlb, 0, sizeof(vm->tlb));
-	// Flush dispatch loop page
-	vm->wait_event = 0;
+    // Flush dispatch loop page
+    atomic_store_explicit(&vm->wait_event, 0, memory_order_release);
 }
 
 bool riscv32_mmu_translate(riscv32_vm_state_t* vm, uint32_t addr, uint8_t access, uint32_t* dest_addr)

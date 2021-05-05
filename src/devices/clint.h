@@ -21,6 +21,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "riscv32.h"
 
+#define CLINT_BASE_ADDR 0x2000000
+#define CLINT_LEN 0x10000
+
 bool clint_mmio_handler(riscv32_vm_state_t* vm, riscv32_mmio_device_t* device, uint32_t offset, void* data, uint32_t size, uint8_t access);
 
 #endif
